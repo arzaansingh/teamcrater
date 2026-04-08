@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Reward logs (generated at runtime)
+rewards_*.csv
+
+# OS
+.DS_Store
+
+# Trained RL model (too large for git — SCP to Jetson separately)
+*.zip
+
+# Jetson-specific (cloned from Waveshare, not our code)
+ugv_jetson/
+ugv_ws/
+ugv_ws.zip
