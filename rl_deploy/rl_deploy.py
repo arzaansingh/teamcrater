@@ -93,11 +93,13 @@ DETECT_OBSTACLE_CLASSES = {
 }
 
 # Gimbal scanning
-GIMBAL_SCAN_ANGLE = 45        # degrees left/right from center
-GIMBAL_SCAN_SPEED = 100       # servo speed (0=fastest, higher=slower)
-GIMBAL_SCAN_ACCEL = 50        # servo acceleration
-GIMBAL_SCAN_INTERVAL = 10     # control steps between scan moves (2s at 5Hz)
+GIMBAL_SCAN_ANGLE = 70        # degrees left/right from center (wider sweep)
+GIMBAL_SCAN_SPEED = 60        # servo speed (0=fastest, lower=faster scan)
+GIMBAL_SCAN_ACCEL = 40        # servo acceleration
+GIMBAL_SCAN_INTERVAL = 8      # control steps between scan moves (1.6s at 5Hz)
 GIMBAL_TILT_DEFAULT = 0       # level — tilt down was reading the FLOOR as an obstacle
+GIMBAL_TILT_UP = 15           # degrees up for face scanning (people are taller than rover)
+GIMBAL_TILT_DOWN = -10        # degrees down for close-range scanning
 GIMBAL_SETTLE_STEPS = 2       # steps to wait after centering before depth capture
 
 # Odometry
@@ -116,13 +118,26 @@ DEFAULT_STATE = np.array([1.0, 0.0, 0.0, 1.0], dtype=np.float32)
 
 # Face navigation
 FACE_HFOV_RAD = math.radians(73)       # OAK-D Lite horizontal FOV
+FACE_VFOV_RAD = math.radians(58)       # OAK-D Lite vertical FOV (~58° for 4:3 sensor)
 FACE_DEPTH_PATCH = 7                    # pixels to sample for depth median
-FACE_STOP_DISTANCE = 1.0               # meters — stop when this close to face
-FACE_RECHECK_STEPS = 10                # re-detect face every N steps (2s at 5Hz)
-FACE_SEARCH_SPEED = 0.25               # rad/s rotation during search
-FACE_SEARCH_REVERSE_TIME = 3.0         # seconds before reversing search direction
-FACE_SEARCH_TIMEOUT = 60.0             # seconds before giving up search
-FACE_LOST_HOLD_TIME = 1.0              # seconds to hold last state when face lost
+FACE_STOP_DISTANCE = 0.8                 # meters — comfortable stop distance from person
+FACE_RECHECK_STEPS = 2                 # re-detect face every N steps (0.4s at 5Hz) — fast!
+FACE_SEARCH_SPIN_SPEED = 0.35          # rad/s rotation during scan (smoother for detection)
+FACE_SEARCH_SPIN_DURATION = 8.0        # seconds for a scan rotation
+FACE_SEARCH_DRIVE_DURATION = 6.0       # seconds of RL-driven exploration between scans
+FACE_LOST_HOLD_TIME = 2.0              # seconds to hold last state when face lost (drive to estimate)
+FACE_LOST_SPIN_TIME = 5.0              # seconds to spin searching after losing face
+FACE_MIN_NAVIGATE_STEPS = 10           # min steps (2s) before ARRIVED can trigger
+FACE_APPROACH_GAIN = 1.5               # angular gain for steering toward face (proportional control)
+FACE_APPROACH_MAX_ANG = 0.4            # max angular vel during face approach (rad/s)
+
+# Red target detection (HSV-based — very robust, no ML needed)
+RED_HSV_LOWER1 = np.array([0, 120, 70])    # red wraps around 0° in HSV
+RED_HSV_UPPER1 = np.array([10, 255, 255])
+RED_HSV_LOWER2 = np.array([170, 120, 70])
+RED_HSV_UPPER2 = np.array([180, 255, 255])
+RED_MIN_AREA_FRAC = 0.002              # minimum fraction of frame area to count as target
+RED_STOP_DISTANCE = 0.10               # meters — stop RIGHT next to the target (10cm)
 
 # Terrain segmentation
 SEG_RUN_INTERVAL = 10                   # run segmentation every N steps (2s at 5Hz)
@@ -135,75 +150,143 @@ SEG_SIGMOID_WIDTH = 0.5                 # sigmoid sharpness for feasibility scor
 # ---------------------------------------------------------------------------
 
 class FaceTracker:
-    """Detects faces via Haar cascade (primary) or MobileNet-SSD person detection (fallback).
-    Estimates angle and distance to the largest detected face."""
+    """Detects faces/people using a cascade of detectors (best first):
+      1. DNN face detector (OpenCV Caffe model — very reliable)
+      2. Haar cascade (fast but brittle)
+      3. MobileNet-SSD 'person' class (full-body fallback)
+    Estimates angle and distance to the largest detection."""
+
+    FACE_DNN_CONFIDENCE = 0.35     # DNN face detection threshold
+    PERSON_CONFIDENCE = 0.4        # MobileNet person detection threshold
 
     def __init__(self, detector=None):
         import cv2
-        haar_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                 'ugv_jetson', 'models', 'haarcascade_frontalface_default.xml')
+
+        models_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   'ugv_jetson', 'models')
+
+        # --- DNN face detector (best) ---
+        self.dnn_net = None
+        dnn_proto = os.path.join(models_dir, 'face_deploy.prototxt')
+        dnn_model = os.path.join(models_dir, 'face_res10.caffemodel')
+        if os.path.exists(dnn_proto) and os.path.exists(dnn_model):
+            try:
+                self.dnn_net = cv2.dnn.readNetFromCaffe(dnn_proto, dnn_model)
+                print("[OK] DNN face detector loaded (res10 SSD)")
+            except Exception as e:
+                print(f"[WARN] DNN face detector failed: {e}")
+        else:
+            print(f"[WARN] DNN face model not found at {models_dir}")
+
+        # --- Haar cascade (backup) ---
         self.cascade = None
+        haar_path = os.path.join(models_dir, 'haarcascade_frontalface_default.xml')
         if os.path.exists(haar_path):
             self.cascade = cv2.CascadeClassifier(haar_path)
             if self.cascade.empty():
                 self.cascade = None
-                print("[WARN] Haar cascade failed to load")
             else:
                 print("[OK] Haar cascade face detector loaded")
-        else:
-            print(f"[WARN] Haar cascade not found at {haar_path}")
 
-        self.detector = detector  # MobileNet-SSD fallback (ObjectDetector or None)
+        # --- MobileNet-SSD person fallback ---
+        self.detector = detector
         self.last_face = None     # (angle_rad, distance_m, timestamp)
+        self._detect_count = 0
+        self._found_count = 0
+        self._last_method = ''
+        self.last_area_frac = 0.0
+        self._last_vert_angle = 0.0  # vertical angle for 3D tracking
 
     def detect(self, rgb_frame, depth_frame):
-        """Detect largest face and estimate polar coordinates.
+        """Detect largest face/person and estimate polar coordinates.
+
+        Detection cascade:
+          1. DNN face detector (best for real faces, works in varied lighting)
+          2. Haar cascade (works for frontal faces in good lighting)
+          3. MobileNet-SSD 'person' (detects full body — good when face is obscured)
 
         Returns:
             (found, angle_rad, distance_m)
-            angle_rad: horizontal angle from camera center (+=right, -=left)
-            distance_m: estimated distance from depth frame
         """
         import cv2
 
         if rgb_frame is None:
             return False, 0.0, 0.0
 
+        self._detect_count += 1
         h_rgb, w_rgb = rgb_frame.shape[:2]
         best_cx, best_cy, best_area = None, None, 0
+        method = ''
 
-        # --- Primary: Haar cascade face detection ---
-        if self.cascade is not None:
+        # --- 1. DNN face detector (most reliable) ---
+        if best_cx is None and self.dnn_net is not None:
+            blob = cv2.dnn.blobFromImage(rgb_frame, 1.0, (300, 300),
+                                          (104.0, 177.0, 123.0))
+            self.dnn_net.setInput(blob)
+            detections = self.dnn_net.forward()
+            for i in range(detections.shape[2]):
+                conf = float(detections[0, 0, i, 2])
+                if conf > self.FACE_DNN_CONFIDENCE:
+                    box = detections[0, 0, i, 3:7]
+                    x1 = max(0, int(box[0] * w_rgb))
+                    y1 = max(0, int(box[1] * h_rgb))
+                    x2 = min(w_rgb, int(box[2] * w_rgb))
+                    y2 = min(h_rgb, int(box[3] * h_rgb))
+                    area = (x2 - x1) * (y2 - y1)
+                    if area > best_area:
+                        best_area = area
+                        best_cx = (x1 + x2) / 2.0
+                        best_cy = (y1 + y2) / 2.0
+                        method = f'DNN({conf:.2f})'
+
+        # --- 2. Haar cascade (fast, frontal faces only) ---
+        if best_cx is None and self.cascade is not None:
             gray = cv2.cvtColor(rgb_frame, cv2.COLOR_BGR2GRAY)
-            faces = self.cascade.detectMultiScale(gray, scaleFactor=1.2,
-                                                   minNeighbors=5, minSize=(30, 30))
+            # Equalize histogram for better detection in dark conditions
+            gray = cv2.equalizeHist(gray)
+            faces = self.cascade.detectMultiScale(gray, scaleFactor=1.1,
+                                                   minNeighbors=3, minSize=(20, 20))
             for (x, y, w, fh) in faces:
                 area = w * fh
                 if area > best_area:
                     best_area = area
                     best_cx = x + w / 2.0
                     best_cy = y + fh / 2.0
+                    method = 'Haar'
 
-        # --- Fallback: MobileNet-SSD 'person' detection ---
+        # --- 3. MobileNet-SSD 'person' detection (full body) ---
         if best_cx is None and self.detector is not None:
             detections = self.detector.detect(rgb_frame)
             for det in detections:
-                if det['class'] == 'person' and det['confidence'] > 0.4:
-                    bbox = det['bbox']  # (xmin, ymin, xmax, ymax) normalized [0,1]
+                cls = det['class']
+                conf = det['confidence']
+                if cls == 'person' and conf > self.PERSON_CONFIDENCE:
+                    bbox = det['bbox']
                     bw = (bbox[2] - bbox[0]) * w_rgb
                     bh = (bbox[3] - bbox[1]) * h_rgb
                     area = bw * bh
                     if area > best_area:
                         best_area = area
                         best_cx = (bbox[0] + bbox[2]) / 2.0 * w_rgb
-                        best_cy = (bbox[1] + bbox[3]) / 2.0 * h_rgb
+                        # Aim at upper third of person bbox (where face likely is)
+                        best_cy = (bbox[1] * 0.7 + bbox[3] * 0.3) * h_rgb
+                        method = f'Person({conf:.2f})'
 
         if best_cx is None:
             return False, 0.0, 0.0
 
-        # --- Compute angle from center_x ---
+        self._found_count += 1
+        self._last_method = method
+
+        # --- Compute horizontal + vertical angle from frame center ---
         center_x_norm = best_cx / w_rgb  # [0, 1]
-        angle_rad = (center_x_norm - 0.5) * FACE_HFOV_RAD
+        center_y_norm = best_cy / h_rgb  # [0, 1]
+        angle_rad = (center_x_norm - 0.5) * FACE_HFOV_RAD   # horizontal
+        vert_angle_rad = -(center_y_norm - 0.5) * FACE_VFOV_RAD  # vertical (neg = up in frame)
+
+        # Store for 3D tracking (gimbal offset added by FaceNavigationSM)
+        self._last_vert_angle = vert_angle_rad
+        self.last_area_frac = best_area / (h_rgb * w_rgb)
 
         # --- Compute distance from depth frame ---
         h_d, w_d = depth_frame.shape[:2]
@@ -228,9 +311,196 @@ class DummyFaceTracker:
     """No-op face tracker for testing/demo mode."""
     def __init__(self):
         self.last_face = None
+        self._detect_count = 0
+        self._found_count = 0
+        self._last_method = ''
+        self.last_area_frac = 0.0
+        self._last_vert_angle = 0.0
 
     def detect(self, rgb_frame, depth_frame):
         return False, 0.0, 0.0
+
+
+# ---------------------------------------------------------------------------
+# Red Target Tracker (HSV color detection — very robust)
+# ---------------------------------------------------------------------------
+
+class RedTargetTracker:
+    """Detects a red flag/square using HSV color thresholding + ML confirmation.
+
+    Two-stage detection:
+      1. HSV color masking (fast, finds red regions)
+      2. Shape analysis (aspect ratio, solidity check — is it flag-shaped?)
+
+    Much more reliable than face detection — works at any angle, distance,
+    lighting condition. HSV handles the heavy lifting, shape analysis
+    filters false positives (red shirt, red wall, etc.).
+    """
+
+    def __init__(self):
+        self.last_face = None  # (angle_rad, distance_m, timestamp)
+        self._detect_count = 0
+        self._found_count = 0
+        self._last_method = 'Red-HSV'
+        # Confidence boost from consecutive detections
+        self._consecutive = 0
+        self._last_cx = None
+        self._last_cy = None
+        self.last_area_frac = 0.0
+        self._consecutive_area = 0  # consecutive frames with area > threshold
+
+    def detect(self, rgb_frame, depth_frame):
+        """Detect largest red region and estimate polar coordinates.
+
+        Returns: (found, angle_rad, distance_m) — same interface as FaceTracker.
+        """
+        import cv2
+
+        if rgb_frame is None:
+            return False, 0.0, 0.0
+
+        self._detect_count += 1
+        h_rgb, w_rgb = rgb_frame.shape[:2]
+
+        # Convert to HSV for robust color detection
+        hsv = cv2.cvtColor(rgb_frame, cv2.COLOR_BGR2HSV)
+
+        # Red wraps around 0° in HSV — need two ranges
+        mask1 = cv2.inRange(hsv, RED_HSV_LOWER1, RED_HSV_UPPER1)
+        mask2 = cv2.inRange(hsv, RED_HSV_LOWER2, RED_HSV_UPPER2)
+        red_mask = mask1 | mask2
+
+        # Morphological cleanup — remove noise, fill gaps
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_CLOSE, kernel)
+        red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_OPEN, kernel)
+
+        # Find contours
+        contours, _ = cv2.findContours(red_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        if not contours:
+            self._consecutive = 0
+            self._consecutive_area = 0
+            return False, 0.0, 0.0
+
+        # --- Garble detection: if red pixels are spread everywhere, frame is bad ---
+        # A garbled frame has red artifacts scattered across the whole image.
+        # A real red target is LOCALIZED (single region, not everywhere).
+        total_red_pixels = np.count_nonzero(red_mask)
+        frame_area = h_rgb * w_rgb
+        total_red_frac = total_red_pixels / frame_area
+
+        # If >30% of entire frame is "red", it's garbled/noise, not a real target
+        if total_red_frac > 0.30:
+            self._consecutive = 0
+            self._consecutive_area = 0
+            print(f"  [RED] Garble detected: {total_red_frac:.1%} of frame is red — skipping")
+            return False, 0.0, 0.0
+
+        # Also check if red is spread across too many separate regions (garble = many blobs)
+        if len(contours) > 15:
+            self._consecutive = 0
+            self._consecutive_area = 0
+            print(f"  [RED] Too many red blobs ({len(contours)}) — likely garbled frame")
+            return False, 0.0, 0.0
+
+        # Find largest contour that meets minimum area + shape checks
+        min_area = frame_area * RED_MIN_AREA_FRAC
+        best_contour = None
+        best_area = 0
+        best_score = 0
+
+        for c in contours:
+            area = cv2.contourArea(c)
+            if area < min_area:
+                continue
+
+            # Shape analysis: prefer compact, roughly rectangular shapes
+            hull_area = cv2.contourArea(cv2.convexHull(c))
+            solidity = area / hull_area if hull_area > 0 else 0
+            x, y, bw, bh = cv2.boundingRect(c)
+            aspect = max(bw, bh) / (min(bw, bh) + 1e-6)
+
+            # Reject contours that span nearly the entire frame (garble artifact)
+            if bw > w_rgb * 0.7 and bh > h_rgb * 0.7:
+                continue  # real target won't fill 70%+ of both dimensions
+
+            # Score: bigger area + compact shape + reasonable aspect ratio
+            shape_score = solidity * (1.0 if aspect < 4 else 0.5)
+            total_score = area * shape_score
+
+            if total_score > best_score:
+                best_score = total_score
+                best_area = area
+                best_contour = c
+
+        if best_contour is None:
+            self._consecutive = 0
+            self._consecutive_area = 0
+            return False, 0.0, 0.0
+
+        self._found_count += 1
+        self._consecutive += 1
+
+        # Compute centroid
+        M = cv2.moments(best_contour)
+        if M['m00'] == 0:
+            return False, 0.0, 0.0
+        best_cx = M['m10'] / M['m00']
+        best_cy = M['m01'] / M['m00']
+
+        # Consistency check: if centroid jumped far from last frame, lower confidence
+        if self._last_cx is not None:
+            jump = math.sqrt((best_cx - self._last_cx)**2 + (best_cy - self._last_cy)**2)
+            if jump > w_rgb * 0.3:
+                self._consecutive = 1  # reset streak on big jump
+        self._last_cx = best_cx
+        self._last_cy = best_cy
+
+        area_frac = best_area / frame_area
+        self._last_method = f'Red-HSV({area_frac:.1%},str={self._consecutive})'
+        self.last_area_frac = area_frac  # expose for proximity check
+
+        # Track consecutive frames with high area (for robust ARRIVED)
+        if area_frac > 0.12:
+            self._consecutive_area += 1
+        else:
+            self._consecutive_area = 0
+
+        # Compute horizontal + vertical angle from frame center
+        center_x_norm = best_cx / w_rgb
+        center_y_norm = best_cy / h_rgb
+        angle_rad = (center_x_norm - 0.5) * FACE_HFOV_RAD       # horizontal
+        vert_angle_rad = -(center_y_norm - 0.5) * FACE_VFOV_RAD  # vertical (neg = up)
+        self._last_vert_angle = vert_angle_rad  # expose for 3D tracking
+
+        # Compute distance from depth frame — BUT depth is unreliable at close range
+        # (stereo camera fails below ~25cm). Use area fraction as a backup proxy.
+        h_d, w_d = depth_frame.shape[:2]
+        cx_d = int(best_cx * w_d / w_rgb)
+        cy_d = int(best_cy * h_d / h_rgb)
+        cx_d = max(FACE_DEPTH_PATCH // 2, min(w_d - FACE_DEPTH_PATCH // 2 - 1, cx_d))
+        cy_d = max(FACE_DEPTH_PATCH // 2, min(h_d - FACE_DEPTH_PATCH // 2 - 1, cy_d))
+
+        half = FACE_DEPTH_PATCH // 2
+        patch = depth_frame[cy_d - half:cy_d + half + 1, cx_d - half:cx_d + half + 1]
+        valid = patch[patch > 0.02]
+        if len(valid) > 0:
+            distance_m = float(np.median(valid))
+        else:
+            distance_m = 5.0
+
+        # At close range, depth sensor gives garbage (jumps to 5-8m).
+        # Use area fraction as a more reliable distance proxy:
+        # ~1% area ≈ 2m, ~5% ≈ 0.8m, ~10% ≈ 0.4m, ~20% ≈ 0.2m, ~40% ≈ 0.1m
+        if area_frac > 0.03 and distance_m > 2.0:
+            # Depth is clearly wrong — object fills 3%+ of frame but depth says >2m
+            # Estimate distance from area instead
+            distance_m = max(0.08, 0.5 / math.sqrt(area_frac / 0.03))
+            self._last_method += '(area-est)'
+
+        self.last_face = (angle_rad, distance_m, time.time())
+        return True, angle_rad, distance_m
 
 
 # ---------------------------------------------------------------------------
@@ -238,113 +508,419 @@ class DummyFaceTracker:
 # ---------------------------------------------------------------------------
 
 class FaceNavigationSM:
-    """Navigate toward a detected face using the RL model.
+    """Navigate toward a detected face/target using DIRECT proportional control.
 
-    The face detector updates the state vector fed to the RL model.
-    The RL model controls ALL steering and avoidance.
-    The only override is SEARCH mode (rotate to find a face).
+    Instead of relying on the RL model to interpret an encoded state vector
+    (which it wasn't trained for), this SM uses proportional control:
+    - Steer toward the target using angle from camera center
+    - Drive forward at a speed proportional to distance
+    - The RL model is only used during SEARCH_DRIVE for exploration
 
-    States: SEARCH → NAVIGATE → LOST → ARRIVED
+    States:
+        SEARCH_SPIN  → slow rotation scanning for target
+        SEARCH_DRIVE → RL drives forward exploring, checking for target
+        NAVIGATE     → target found, DIRECT proportional steering toward it
+        LOST_HOLD    → target just lost, drive toward estimated world position
+        LOST_SPIN    → target lost for a while, spin to re-find
+        ARRIVED      → within stop distance, mission complete
+
+    Key improvement: When target is found, we estimate its WORLD POSITION
+    (using odometry + angle + depth). If we lose the target, we drive toward
+    that estimated position rather than immediately spinning.
     """
 
-    def __init__(self, face_tracker, odom, stop_distance=FACE_STOP_DISTANCE):
+    def __init__(self, face_tracker, odom, stop_distance=FACE_STOP_DISTANCE,
+                 max_speed=0.15, gimbal_base=None):
         self.tracker = face_tracker
         self.odom = odom
         self.stop_distance = stop_distance
-        self.state = 'SEARCH'
+        self.max_speed = max_speed
+        self.gimbal_base = gimbal_base  # for active gimbal tracking
+        self.state = 'SEARCH_SPIN'
         self.reached = False
         self._steps_since_recheck = 0
-        self._last_state_vector = DEFAULT_STATE.copy()
+        self._navigate_steps = 0
         # Search state
         self._search_dir = 1
-        self._search_flip_time = time.time()
-        self._search_start = time.time()
+        self._phase_start = time.time()
+        self._search_count = 0
+        self._explored_headings = []      # track which headings we've looked at
         # Lost state
         self._lost_time = None
+        # 3D target world position estimate (x, y, z)
+        self._target_world_x = None
+        self._target_world_y = None
+        self._target_world_z = None       # height above rover's ground plane
+        self._last_angle = 0.0
+        self._last_vert_angle = 0.0       # vertical angle to target
+        self._last_distance = 5.0
+        self._consecutive_found = 0       # consecutive detections (for confidence)
+        # Gimbal tracking state
+        self._gimbal_pan = 0              # current gimbal pan angle (degrees)
+        self._gimbal_tilt = 0             # current gimbal tilt angle (degrees)
+        # Random exploration waypoint for SEARCH_DRIVE
+        self._explore_state = self._random_explore_state()
+
+    @staticmethod
+    def _random_explore_state():
+        angle = np.random.uniform(-0.5, 0.5)
+        return np.array([
+            math.cos(angle), math.sin(angle), 0.0, 1.0
+        ], dtype=np.float32)
+
+    def _get_gimbal_compensated_angles(self, frame_h_angle, frame_v_angle):
+        """Adjust detection angles by current gimbal pan/tilt offset.
+
+        The camera frame angles are relative to where the gimbal is pointing.
+        Add gimbal offsets to get angles relative to the rover's forward axis.
+        """
+        # Gimbal pan/tilt are in degrees, convert to radians
+        total_h_angle = frame_h_angle + math.radians(self._gimbal_pan)
+        total_v_angle = frame_v_angle + math.radians(self._gimbal_tilt)
+        return total_h_angle, total_v_angle
+
+    def _update_target_world_pos(self, angle_rad, distance_m):
+        """Estimate target's 3D world position using odometry + detection + gimbal.
+
+        Uses the vertical angle (from camera + gimbal tilt) to compute the
+        target's height above the ground plane, and the horizontal distance
+        for the 2D position on the ground.
+        """
+        # Get vertical angle (from frame detection + gimbal tilt)
+        vert_angle = getattr(self.tracker, '_last_vert_angle', 0.0)
+        _, total_vert = self._get_gimbal_compensated_angles(angle_rad, vert_angle)
+        total_h, _ = self._get_gimbal_compensated_angles(angle_rad, vert_angle)
+
+        # 3D decomposition: distance is slant range from camera to target
+        # horizontal_dist = distance * cos(vertical_angle)  (ground plane distance)
+        # height = distance * sin(vertical_angle)  (above/below camera level)
+        horizontal_dist = distance_m * math.cos(total_vert)
+        target_height = distance_m * math.sin(total_vert)
+
+        # 2D world position (ground plane)
+        world_angle = self.odom.heading + total_h
+        self._target_world_x = self.odom.x + horizontal_dist * math.cos(world_angle)
+        self._target_world_y = self.odom.y + horizontal_dist * math.sin(world_angle)
+        # Z = height relative to rover camera (positive = above camera)
+        self._target_world_z = target_height
+
+    def _angle_to_target_world(self):
+        """Compute horizontal angle from rover to estimated target world position."""
+        if self._target_world_x is None:
+            return 0.0
+        dx = self._target_world_x - self.odom.x
+        dy = self._target_world_y - self.odom.y
+        target_angle = math.atan2(dy, dx)
+        error = target_angle - self.odom.heading
+        return (error + math.pi) % (2 * math.pi) - math.pi
+
+    def _dist_to_target_world(self):
+        """Ground-plane distance from rover to estimated target world position."""
+        if self._target_world_x is None:
+            return 999.0
+        dx = self._target_world_x - self.odom.x
+        dy = self._target_world_y - self.odom.y
+        return math.sqrt(dx**2 + dy**2)
+
+    def _vert_angle_to_target_world(self):
+        """Vertical angle to target from current position (for gimbal aiming)."""
+        if self._target_world_z is None:
+            return 0.0
+        ground_dist = self._dist_to_target_world()
+        if ground_dist < 0.1:
+            return 0.0
+        return math.atan2(self._target_world_z, ground_dist)
+
+    def _update_gimbal_tracking(self, h_angle_rad, v_angle_rad):
+        """Actively point gimbal toward target for better tracking.
+
+        During NAVIGATE: tilt gimbal to keep target centered vertically.
+        During SEARCH: gimbal does its own scanning (controlled by GimbalScanner).
+        """
+        if self.gimbal_base is None:
+            return
+
+        if self.state == 'NAVIGATE':
+            # Compute desired tilt to keep target vertically centered
+            # Positive v_angle = target is above camera → tilt up (positive tilt)
+            desired_tilt = int(math.degrees(v_angle_rad))
+            desired_tilt = max(-20, min(25, desired_tilt))  # clamp for safety
+
+            # Only update gimbal if tilt changed significantly (avoid servo jitter)
+            if abs(desired_tilt - self._gimbal_tilt) >= 3:
+                self._gimbal_tilt = desired_tilt
+                # Pan stays at 0 during NAVIGATE — rover turns its body to aim
+                self._gimbal_pan = 0
+                self.gimbal_base.gimbal_ctrl(
+                    self._gimbal_pan, self._gimbal_tilt,
+                    GIMBAL_SCAN_SPEED, GIMBAL_SCAN_ACCEL)
+
+        elif self.state in ('LOST_HOLD',):
+            # When target lost, tilt toward estimated world position
+            vert = self._vert_angle_to_target_world()
+            desired_tilt = int(math.degrees(vert))
+            desired_tilt = max(-20, min(25, desired_tilt))
+            if abs(desired_tilt - self._gimbal_tilt) >= 3:
+                self._gimbal_tilt = desired_tilt
+                self._gimbal_pan = 0
+                self.gimbal_base.gimbal_ctrl(
+                    0, self._gimbal_tilt,
+                    GIMBAL_SCAN_SPEED, GIMBAL_SCAN_ACCEL)
+
+    def reset_gimbal(self):
+        """Return gimbal to center (called when leaving NAVIGATE state)."""
+        if self.gimbal_base is not None:
+            self._gimbal_pan = 0
+            self._gimbal_tilt = 0
+            self.gimbal_base.gimbal_ctrl(0, 0, 0, 0)
+
+    def _proportional_steer(self, angle_rad, distance_m):
+        """Direct proportional control: steer toward target and drive forward.
+
+        This is MUCH more reliable than passing an encoded state to the RL model,
+        because the RL model was trained for waypoint nav, not face following.
+        """
+        # Angular: proportional to angle offset
+        # Positive angle = target is to the right of center
+        # Negative angular velocity = turn right
+        angular = -FACE_APPROACH_GAIN * angle_rad
+        angular = max(-FACE_APPROACH_MAX_ANG, min(FACE_APPROACH_MAX_ANG, angular))
+
+        # Linear: scale with distance, slow down as we approach
+        if distance_m > self.stop_distance * 2:
+            linear = self.max_speed * 0.8
+        elif distance_m > self.stop_distance:
+            frac = (distance_m - self.stop_distance) / self.stop_distance
+            linear = self.max_speed * max(0.2, min(0.8, frac * 0.6))
+        else:
+            linear = 0.0
+
+        # If very off-angle, slow down and focus on turning
+        if abs(angle_rad) > math.radians(25):
+            linear *= 0.3
+
+        return linear, angular
 
     def update(self, rgb_frame, depth_frame):
         """Compute face navigation output.
 
         Returns:
             (override, state_vector)
-            override: (linear, angular) tuple during SEARCH/ARRIVED, or None when RL drives
+            override: (linear, angular) tuple when SM controls rover, or None when RL drives
             state_vector: 4-element numpy array for RL model observation
         """
         found, angle, distance = self.tracker.detect(rgb_frame, depth_frame)
         now = time.time()
 
-        if self.state == 'SEARCH':
-            if found:
-                self.state = 'NAVIGATE'
-                self._steps_since_recheck = 0
-                self._last_state_vector = self._encode_state(angle, distance)
-                print(f"  [FACE] Found! angle={math.degrees(angle):.1f}° dist={distance:.2f}m → NAVIGATE")
-                if distance < self.stop_distance:
-                    self.state = 'ARRIVED'
-                    self.reached = True
-                    return (0.0, 0.0), DEFAULT_STATE.copy()
-                return None, self._last_state_vector
-            # Rotate to search — reverse direction periodically
-            if now - self._search_flip_time > FACE_SEARCH_REVERSE_TIME:
-                self._search_dir *= -1
-                self._search_flip_time = now
-            # Timeout check
-            if now - self._search_start > FACE_SEARCH_TIMEOUT:
-                print("  [FACE] Search timeout — no face found")
-                self.reached = True  # signal to stop
-                return (0.0, 0.0), DEFAULT_STATE.copy()
-            return (0.0, self._search_dir * FACE_SEARCH_SPEED), DEFAULT_STATE.copy()
+        # Get vertical angle from tracker (for 3D positioning + gimbal)
+        raw_vert_angle = getattr(self.tracker, '_last_vert_angle', 0.0)
 
-        elif self.state == 'NAVIGATE':
+        # Compensate detection angles for current gimbal position
+        if found:
+            comp_h, comp_v = self._get_gimbal_compensated_angles(angle, raw_vert_angle)
+        else:
+            comp_h, comp_v = angle, raw_vert_angle
+
+        # --- Check area-based ARRIVED (works even when depth is garbage) ---
+        # Require 3+ CONSECUTIVE high-area frames to avoid false triggers from garbled frames
+        area_frac = getattr(self.tracker, 'last_area_frac', 0.0)
+        consec_area = getattr(self.tracker, '_consecutive_area', 0)
+        if (found and area_frac > 0.15 and consec_area >= 3
+                and self._navigate_steps >= FACE_MIN_NAVIGATE_STEPS):
+            self.state = 'ARRIVED'
+            self.reached = True
+            self.reset_gimbal()
+            z_str = f" z={self._target_world_z:.2f}m" if self._target_world_z else ""
+            print(f"  [FACE] ARRIVED via area! area={area_frac:.1%} consec={consec_area} "
+                  f"dist={distance:.2f}m{z_str} after {self._navigate_steps} steps")
+            return (0.0, 0.0), DEFAULT_STATE.copy()
+
+        # --- Any state: if target found, go to NAVIGATE ---
+        if found and self.state not in ('NAVIGATE', 'ARRIVED'):
+            self.state = 'NAVIGATE'
+            if self._navigate_steps == 0:
+                self._navigate_steps = 1
+            self._steps_since_recheck = 0
+            self._last_angle = comp_h   # gimbal-compensated horizontal
+            self._last_vert_angle = comp_v
+            self._last_distance = distance
+            self._consecutive_found = 1
+            self._update_target_world_pos(comp_h, distance)
+            # Start active gimbal tracking
+            self._update_gimbal_tracking(comp_h, comp_v)
+            linear, angular = self._proportional_steer(comp_h, distance)
+            z_str = f" z={self._target_world_z:.2f}m" if self._target_world_z else ""
+            print(f"  [FACE] Found! h={math.degrees(comp_h):.1f}° v={math.degrees(comp_v):.1f}° "
+                  f"dist={distance:.2f}m{z_str} area={area_frac:.1%} → NAVIGATE (3D)")
+            return (linear, angular), DEFAULT_STATE.copy()
+
+        # --- SEARCH_SPIN: slow rotation scanning ---
+        if self.state == 'SEARCH_SPIN':
+            elapsed = now - self._phase_start
+            if elapsed > 0 and int(elapsed * 2) > len(self._explored_headings):
+                self._explored_headings.append(math.degrees(self.odom.heading) % 360)
+            if elapsed >= FACE_SEARCH_SPIN_DURATION:
+                self.state = 'SEARCH_DRIVE'
+                self._phase_start = now
+                self._explore_state = self._random_explore_state()
+                self._search_count += 1
+                print(f"  [FACE] Spin done, exploring (cycle #{self._search_count}, "
+                      f"explored {len(self._explored_headings)} directions)")
+                return None, self._explore_state
+            return (0.0, self._search_dir * FACE_SEARCH_SPIN_SPEED), DEFAULT_STATE.copy()
+
+        # --- SEARCH_DRIVE: RL drives forward exploring ---
+        if self.state == 'SEARCH_DRIVE':
+            elapsed = now - self._phase_start
+            if elapsed >= FACE_SEARCH_DRIVE_DURATION:
+                self.state = 'SEARCH_SPIN'
+                self._phase_start = now
+                self._search_dir *= -1
+                print(f"  [FACE] Explore done, spinning again")
+                return (0.0, self._search_dir * FACE_SEARCH_SPIN_SPEED), DEFAULT_STATE.copy()
+            return None, self._explore_state
+
+        # --- NAVIGATE: DIRECT proportional steering toward target ---
+        if self.state == 'NAVIGATE':
+            self._navigate_steps += 1
             self._steps_since_recheck += 1
+
             if self._steps_since_recheck >= FACE_RECHECK_STEPS:
                 self._steps_since_recheck = 0
                 if found:
-                    if distance < self.stop_distance:
-                        self.state = 'ARRIVED'
-                        self.reached = True
-                        print(f"  [FACE] ARRIVED! dist={distance:.2f}m")
-                        return (0.0, 0.0), DEFAULT_STATE.copy()
-                    self._last_state_vector = self._encode_state(angle, distance)
-                    print(f"  [FACE] Tracking: angle={math.degrees(angle):.1f}° dist={distance:.2f}m")
-                else:
-                    self.state = 'LOST'
-                    self._lost_time = now
-                    print("  [FACE] Lost target → LOST")
-            # RL drives with face-encoded state vector
-            return None, self._last_state_vector
+                    self._consecutive_found += 1
+                    self._last_angle = comp_h
+                    self._last_vert_angle = comp_v
+                    self._last_distance = distance
+                    self._update_target_world_pos(comp_h, distance)
+                    # Active gimbal tracking — tilt toward target
+                    self._update_gimbal_tracking(comp_h, comp_v)
 
-        elif self.state == 'LOST':
+                    # ARRIVED: depth-based OR area-based
+                    if self._navigate_steps >= FACE_MIN_NAVIGATE_STEPS:
+                        if distance < self.stop_distance or (area_frac > 0.15 and consec_area >= 3):
+                            self.state = 'ARRIVED'
+                            self.reached = True
+                            self.reset_gimbal()
+                            z_str = f" z={self._target_world_z:.2f}m" if self._target_world_z else ""
+                            print(f"  [FACE] ARRIVED! dist={distance:.2f}m area={area_frac:.1%}"
+                                  f"{z_str} after {self._navigate_steps} steps")
+                            return (0.0, 0.0), DEFAULT_STATE.copy()
+
+                    linear, angular = self._proportional_steer(comp_h, distance)
+                    z_str = f" z={self._target_world_z:.2f}m" if self._target_world_z else ""
+                    print(f"  [FACE] Tracking: h={math.degrees(comp_h):.1f}° v={math.degrees(comp_v):.1f}° "
+                          f"dist={distance:.2f}m{z_str} area={area_frac:.1%} "
+                          f"(step {self._navigate_steps}, streak={self._consecutive_found})")
+                    return (linear, angular), DEFAULT_STATE.copy()
+                else:
+                    self._consecutive_found = 0
+                    self.state = 'LOST_HOLD'
+                    self._lost_time = now
+                    # Update gimbal to point toward estimated position
+                    self._update_gimbal_tracking(
+                        self._angle_to_target_world(),
+                        self._vert_angle_to_target_world())
+                    z_str = f" z={self._target_world_z:.2f}m" if self._target_world_z else ""
+                    print(f"  [FACE] Lost target → LOST_HOLD (3D est: "
+                          f"dist={self._dist_to_target_world():.1f}m{z_str})")
+
+            # Between rechecks: use proportional steer from last known angle/distance
+            linear, angular = self._proportional_steer(self._last_angle, self._last_distance)
+            return (linear, angular), DEFAULT_STATE.copy()
+
+        # --- LOST_HOLD: drive toward estimated 3D world position ---
+        if self.state == 'LOST_HOLD':
             if found:
                 self.state = 'NAVIGATE'
                 self._steps_since_recheck = 0
-                self._last_state_vector = self._encode_state(angle, distance)
-                print(f"  [FACE] Re-acquired! angle={math.degrees(angle):.1f}° dist={distance:.2f}m")
-                return None, self._last_state_vector
-            if now - self._lost_time > FACE_LOST_HOLD_TIME:
-                self.state = 'SEARCH'
-                self._search_start = now
-                self._search_flip_time = now
-                print("  [FACE] Lost too long → SEARCH")
-                return (0.0, self._search_dir * FACE_SEARCH_SPEED), DEFAULT_STATE.copy()
-            # Hold last state — RL drives toward last known position
-            return None, self._last_state_vector
+                self._consecutive_found = 1
+                self._last_angle = comp_h
+                self._last_vert_angle = comp_v
+                self._last_distance = distance
+                self._update_target_world_pos(comp_h, distance)
+                self._update_gimbal_tracking(comp_h, comp_v)
+                linear, angular = self._proportional_steer(comp_h, distance)
+                print(f"  [FACE] Re-acquired! h={math.degrees(comp_h):.1f}° v={math.degrees(comp_v):.1f}° "
+                      f"dist={distance:.2f}m area={area_frac:.1%} (cumulative step {self._navigate_steps})")
+                return (linear, angular), DEFAULT_STATE.copy()
 
-        elif self.state == 'ARRIVED':
+            if now - self._lost_time > FACE_LOST_HOLD_TIME:
+                self.state = 'LOST_SPIN'
+                self._phase_start = now
+                self.reset_gimbal()  # center gimbal for search
+                print("  [FACE] Still lost → LOST_SPIN")
+                return (0.0, self._search_dir * FACE_SEARCH_SPIN_SPEED), DEFAULT_STATE.copy()
+
+            # Drive toward estimated world position using odometry
+            angle_to_target = self._angle_to_target_world()
+            dist_to_target = self._dist_to_target_world()
+            if dist_to_target > 0.3:
+                lin = self.max_speed * 0.5
+                ang = -FACE_APPROACH_GAIN * angle_to_target
+                ang = max(-FACE_APPROACH_MAX_ANG, min(FACE_APPROACH_MAX_ANG, ang))
+                return (lin, ang), DEFAULT_STATE.copy()
+            else:
+                self.state = 'LOST_SPIN'
+                self._phase_start = now
+                return (0.0, self._search_dir * FACE_SEARCH_SPIN_SPEED), DEFAULT_STATE.copy()
+
+        # --- LOST_SPIN: spin in place trying to re-find ---
+        if self.state == 'LOST_SPIN':
+            if found:
+                self.state = 'NAVIGATE'
+                # DON'T reset _navigate_steps — keep accumulating
+                self._steps_since_recheck = 0
+                self._consecutive_found = 1
+                self._last_angle = comp_h
+                self._last_vert_angle = comp_v
+                self._last_distance = distance
+                self._update_target_world_pos(comp_h, distance)
+                self._update_gimbal_tracking(comp_h, comp_v)
+                linear, angular = self._proportional_steer(comp_h, distance)
+                print(f"  [FACE] Re-acquired during spin! h={math.degrees(comp_h):.1f}° "
+                      f"v={math.degrees(comp_v):.1f}° dist={distance:.2f}m")
+                return (linear, angular), DEFAULT_STATE.copy()
+            if now - self._phase_start > FACE_LOST_SPIN_TIME:
+                self.state = 'SEARCH_SPIN'
+                self._phase_start = now
+                self._search_dir *= -1
+                print("  [FACE] Lost spin failed → full SEARCH_SPIN")
+                return (0.0, self._search_dir * FACE_SEARCH_SPIN_SPEED), DEFAULT_STATE.copy()
+            return (0.0, self._search_dir * FACE_SEARCH_SPIN_SPEED), DEFAULT_STATE.copy()
+
+        # --- ARRIVED ---
+        if self.state == 'ARRIVED':
             return (0.0, 0.0), DEFAULT_STATE.copy()
 
         return None, DEFAULT_STATE.copy()
 
-    @staticmethod
-    def _encode_state(angle_rad, distance_m):
-        """Encode face position as SRB-compatible state vector.
-        [cos(angle), sin(angle), 0, normalized_distance]"""
-        return np.array([
-            math.cos(angle_rad),
-            math.sin(angle_rad),
-            0.0,
-            min(distance_m / 10.0, 1.0),
-        ], dtype=np.float32)
+
+def play_arrival_sound():
+    """Play the iconic announcement when the rover reaches its target.
+    Uses espeak (text-to-speech) which is available on Jetson Ubuntu."""
+    import subprocess
+
+    # "Ladies and gentlemen, we got 'em" — the iconic phrase
+    phrase = "Ladies and gentlemen... we got em."
+
+    try:
+        # Max volume (-a 200), deep voice, slow dramatic pace
+        subprocess.Popen(
+            ['espeak', '-a', '200', '-v', 'en+m1', '-s', '110', '-p', '15', phrase],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        print(f'  [SOUND] "{phrase}"')
+    except Exception as e:
+        print(f"  [SOUND] Could not play arrival sound: {e}")
+    # Also try amixer to max out system volume
+    try:
+        subprocess.Popen(
+            ['amixer', 'set', 'Master', '100%'],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -428,6 +1004,7 @@ class TerrainSegmenter:
         self.model.load_state_dict(torch.load(model_path, map_location=self.device))
         self.model.eval()
         self._last_result = (0.8, 0.8, 0.8)
+        self._last_mask = None  # store last segmentation mask for visualization
         print(f"[OK] Terrain segmenter loaded on {self.device}")
 
     def analyze(self, rgb_frame):
@@ -449,7 +1026,8 @@ class TerrainSegmenter:
 
         with self.torch.no_grad():
             output = self.model(tensor)
-        mask = output.argmax(dim=1).squeeze(0).cpu().numpy()  # (480, 720) class indices
+        mask = output.argmax(dim=1).squeeze(0).cpu().numpy().astype(np.uint8)  # (480, 720)
+        self._last_mask = mask
 
         overall = self._compute_feasibility(mask)
         w = mask.shape[1]
@@ -561,18 +1139,21 @@ class ObstacleMemory:
 class GimbalScanner:
     """Periodically pans the gimbal to scan the environment.
 
-    Cycle: center → right → center → left → center → ...
+    Normal mode: center → right → center → left → center → ...
+    Face mode:   wider sweep with vertical tilt cycling (up/level/down)
     Camera MUST be centered when depth is captured for the RL model.
-    Also captures depth readings during side scans to populate obstacle memory.
     """
 
-    def __init__(self, base):
+    def __init__(self, base, face_mode=False):
         self.base = base
+        self.face_mode = face_mode
         self._scan_step = 0           # counts control steps
         self._current_target = 0      # current pan angle target
         self._scan_phase = 0          # 0=center, 1=right, 2=center, 3=left
         self._centering_countdown = 0 # steps remaining before camera is settled
         self._last_scan_depth = {}    # {'left': depth, 'right': depth}
+        self._tilt_cycle = 0          # face mode: cycles through tilt angles
+        self._tilt_angles = [GIMBAL_TILT_DEFAULT, GIMBAL_TILT_UP, GIMBAL_TILT_DOWN]
 
     def is_centered(self):
         """True if camera is at forward-facing position and settled."""
@@ -616,22 +1197,31 @@ class GimbalScanner:
         if step % GIMBAL_SCAN_INTERVAL != 0:
             return None
 
+        # Get current tilt angle (cycle through up/level/down in face mode)
+        if self.face_mode:
+            tilt = self._tilt_angles[self._tilt_cycle % len(self._tilt_angles)]
+        else:
+            tilt = GIMBAL_TILT_DEFAULT
+
         # Scan cycle: center(0) → right(1) → center(2) → left(3) → center(0)
         self._scan_phase = (self._scan_phase + 1) % 4
 
         if self._scan_phase == 1:
             self._current_target = -GIMBAL_SCAN_ANGLE
-            self.base.gimbal_ctrl(-GIMBAL_SCAN_ANGLE, GIMBAL_TILT_DEFAULT,
+            self.base.gimbal_ctrl(-GIMBAL_SCAN_ANGLE, tilt,
                                   GIMBAL_SCAN_SPEED, GIMBAL_SCAN_ACCEL)
             return 'scan_right'
         elif self._scan_phase == 3:
             self._current_target = GIMBAL_SCAN_ANGLE
-            self.base.gimbal_ctrl(GIMBAL_SCAN_ANGLE, GIMBAL_TILT_DEFAULT,
+            self.base.gimbal_ctrl(GIMBAL_SCAN_ANGLE, tilt,
                                   GIMBAL_SCAN_SPEED, GIMBAL_SCAN_ACCEL)
             return 'scan_left'
         else:
             self._current_target = 0
             self._centering_countdown = GIMBAL_SETTLE_STEPS
+            # Advance tilt cycle each time we return to center
+            if self.face_mode:
+                self._tilt_cycle += 1
             self.base.gimbal_ctrl(0, GIMBAL_TILT_DEFAULT,
                                   GIMBAL_SCAN_SPEED, GIMBAL_SCAN_ACCEL)
             return 'centering'
@@ -822,9 +1412,9 @@ class DepthCamera:
                         dai.CameraBoardSocket.CAM_A,
                         sensorResolution=(1920, 1080),
                     )
-                    video_out = cam_rgb.requestOutput((640, 480), type=dai.ImgFrame.Type.BGR888p)
+                    video_out = cam_rgb.requestOutput((640, 480), type=dai.ImgFrame.Type.BGR888i)
                     self.rgb_queue = video_out.createOutputQueue()
-                    print("[OK] RGB camera enabled for object detection")
+                    print("[OK] RGB camera enabled (BGR888i interleaved)")
                 except Exception as e:
                     print(f"[WARN] Could not set up RGB camera: {e}")
                     self.enable_rgb = False
@@ -910,9 +1500,24 @@ class DepthCamera:
         if not self.enable_rgb or self.rgb_queue is None:
             return None
         try:
-            data = self.rgb_queue.tryGet()
+            # Use get() with timeout for a complete, fresh frame.
+            # tryGet() can return stale/partial frames causing garbled output.
+            data = self.rgb_queue.get(timeout=0.5)
             if data is not None:
-                return data.getCvFrame()
+                frame = data.getCvFrame()
+                if frame is not None:
+                    # .copy() is critical — depthai recycles underlying buffers
+                    frame = frame.copy()
+                    # Basic garble check: a valid BGR frame should have reasonable
+                    # channel statistics. Garbled frames often have extreme values.
+                    if frame.shape[2] == 3:
+                        mean_b, mean_g, mean_r = frame.mean(axis=(0, 1))
+                        # Garbled frames often have extreme pink/green — one channel
+                        # is wildly different from others
+                        channel_spread = max(mean_b, mean_g, mean_r) - min(mean_b, mean_g, mean_r)
+                        if channel_spread > 100:
+                            return None  # likely garbled, skip this frame
+                    return frame
         except Exception:
             pass
         return None
@@ -1098,12 +1703,14 @@ class RLDeployController:
                  enable_gimbal=True, target_mode='distance',
                  enable_segmentation=False, seg_model_path=None,
                  face_stop_distance=FACE_STOP_DISTANCE,
-                 log_rewards=False, reward_log_path=None):
+                 log_rewards=False, reward_log_path=None,
+                 frame_dir=None):
         self.max_speed = min(abs(max_speed), MAX_LINEAR_SPEED)
         self.dry_run = dry_run
         self.running = False
         self.base = None
         self.target_mode = target_mode
+        self.frame_dir = frame_dir  # if set, writes camera frames for web UI
 
         # Avoidance state machine
         self._avoid_turn_dir = 0
@@ -1131,8 +1738,8 @@ class RLDeployController:
             sys.exit(1)
 
         # --- Initialize camera ---
-        # Face mode needs RGB even if detection is off
-        needs_rgb = enable_detect or target_mode == 'face' or enable_segmentation
+        # Face/red mode needs RGB even if detection is off
+        needs_rgb = enable_detect or target_mode in ('face', 'red') or enable_segmentation
         if demo:
             self.camera = DummyDepthCamera()
         else:
@@ -1164,7 +1771,7 @@ class RLDeployController:
         # --- Initialize gimbal scanner ---
         base_for_peripherals = self.base if not dry_run else None
         if enable_gimbal:
-            self.gimbal = GimbalScanner(base_for_peripherals)
+            self.gimbal = GimbalScanner(base_for_peripherals, face_mode=(target_mode == 'face'))
             if base_for_peripherals:
                 # Force gimbal to level position on startup
                 base_for_peripherals.gimbal_ctrl(0, 0, 0, 0)
@@ -1181,18 +1788,25 @@ class RLDeployController:
         # --- Initialize destination tracker ---
         self.destination = DestinationTracker(self.odom)
 
-        # --- Initialize face navigation ---
+        # --- Initialize face/red target navigation ---
         self.face_tracker = None
         self.face_nav = None
-        if target_mode == 'face':
+        if target_mode in ('face', 'red'):
             if demo:
                 self.face_tracker = DummyFaceTracker()
+            elif target_mode == 'red':
+                self.face_tracker = RedTargetTracker()
+                print(f"[OK] Red target mode — HSV + MobileNet SSD detection")
             else:
                 self.face_tracker = FaceTracker(detector=self.detector)
-            self.face_nav = FaceNavigationSM(self.face_tracker, self.odom, face_stop_distance)
-            # Disable gimbal scanning in face mode — camera stays centered
-            self.gimbal = GimbalScanner(None)
-            print(f"[OK] Face navigation mode (stop at {face_stop_distance:.1f}m)")
+            self.face_nav = FaceNavigationSM(
+                self.face_tracker, self.odom,
+                stop_distance=face_stop_distance if target_mode == 'face' else RED_STOP_DISTANCE,
+                max_speed=self.max_speed,
+                gimbal_base=self.base if not self.dry_run else None,
+            )
+            print(f"[OK] Target navigation mode: {target_mode} (stop at "
+                  f"{self.face_nav.stop_distance:.1f}m)")
 
         # --- Initialize terrain segmenter ---
         if enable_segmentation and seg_model_path:
@@ -1239,17 +1853,28 @@ class RLDeployController:
             self.base.base_json_ctrl({"T": 13, "X": 0, "Z": 0})
 
     def _get_detection_info(self):
-        """Run object detection on RGB frame. Returns (detected, class, center_x, conf)."""
+        """Run object detection on RGB frame. Returns (detected, class, center_x, conf).
+
+        IMPORTANT: In face/red target mode, 'person' is EXCLUDED from obstacle classes
+        because the rover is trying to navigate TOWARD a person/target, not away from them.
+        """
         rgb = self.camera.get_rgb_frame()
         if rgb is None:
             return False, "", 0.5, 0.0
 
         detections = self.detector.detect(rgb)
 
+        # In face/red mode, exclude 'person' — we're navigating TO them, not avoiding!
+        skip_classes = set()
+        if self.target_mode in ('face', 'red'):
+            skip_classes.add('person')
+
         best = None
         best_danger = 0
         for det in detections:
             cls = det['class']
+            if cls in skip_classes:
+                continue
             if cls in DETECT_OBSTACLE_CLASSES:
                 danger = DETECT_OBSTACLE_CLASSES[cls] * det['confidence']
                 center_dist = abs(det['center_x'] - 0.5)
@@ -1424,9 +2049,28 @@ class RLDeployController:
                 self.odom.update()
 
                 # --- 4. Safety tiers: emergency stop → backup → avoidance ---
+                # When navigating toward a face/target, suppress backup and most avoidance
+                # since the "obstacle" IS the target we're trying to reach
+                _face_approaching = (self.face_nav is not None
+                                     and self.face_nav.state in ('NAVIGATE', 'LOST_HOLD')
+                                     and self.face_nav._navigate_steps >= 3)
 
                 # Tier 1: EMERGENCY STOP — object at ≤5cm or stereo dead zone
-                if min_depth <= EMERGENCY_STOP_DIST:
+                # In face/red mode approaching target: consider this ARRIVED instead of backing up
+                if min_depth <= EMERGENCY_STOP_DIST and _face_approaching:
+                    self._stop_rover()
+                    if self.face_nav._last_distance < self.face_nav.stop_distance * 1.5:
+                        self.face_nav.state = 'ARRIVED'
+                        self.face_nav.reached = True
+                        print(f"  [FACE] ARRIVED via proximity! depth={min_depth:.2f}m")
+                        break
+                    # Not close enough to declared stop distance — just pause
+                    print(f"  [FACE] Emergency proximity but target far — pausing")
+                    step += 1
+                    time.sleep(interval)
+                    continue
+
+                if min_depth <= EMERGENCY_STOP_DIST and not _face_approaching:
                     self._record_obstacle_ahead(min_depth)
                     self._stop_rover()
                     print(f"  [EMERGENCY] Obstacle at {min_depth:.2f}m! Stopped. Backing up...")
@@ -1446,7 +2090,8 @@ class RLDeployController:
                     continue
 
                 # Tier 2: ACTIVE BACKUP — object at ≤15cm, back up while turning
-                if min_depth < BACKUP_DIST:
+                # Suppressed when approaching face target
+                if min_depth < BACKUP_DIST and not _face_approaching:
                     self._record_obstacle_ahead(min_depth)
                     if step % CONTROL_HZ == 0:
                         print(f"  [BACKUP] Obstacle at {min_depth:.2f}m! Backing up...")
@@ -1474,29 +2119,36 @@ class RLDeployController:
                         self.segmenter.analyze(seg_rgb)
                 _, seg_left, seg_right = self.segmenter.last_result
 
-                # --- 5c. Face navigation (before RL inference) ---
+                # --- 5c. Face/target navigation (before RL inference) ---
                 face_override = None
                 state_vector = DEFAULT_STATE.copy()
                 if self.face_nav is not None:
                     face_rgb = self.camera.get_rgb_frame()
                     face_override, state_vector = self.face_nav.update(face_rgb, depth_frame)
                     if self.face_nav.reached:
-                        print(f"\n[NAV] FACE TARGET {'REACHED' if self.face_nav.state == 'ARRIVED' else 'SEARCH TIMEOUT'}!")
+                        print(f"\n[NAV] TARGET REACHED!")
                         if self.face_nav.state == 'ARRIVED':
                             r, e = self.reward_logger.compute_reward(
-                                0, 0, min_depth, mode, face_state='ARRIVED', reached_goal=True)
+                                0, 0, min_depth, 'ARRIVED', face_state='ARRIVED', reached_goal=True)
                             self.reward_logger.log(
                                 step, r, e, 0, 0, min_depth, left_depth, right_depth,
                                 'ARRIVED', 'ARRIVED', seg_left, seg_right,
                                 self.odom.total_distance, self.odom.displacement,
                                 math.degrees(self.odom.heading))
+                            if not self.dry_run:
+                                play_arrival_sound()
                         break
 
                 # --- 6. Compute avoidance ---
-                override, mode = self._compute_avoidance(
-                    min_depth, left_depth, right_depth,
-                    obj_detected, obj_class, obj_center_x, obj_conf,
-                    seg_left_feas=seg_left, seg_right_feas=seg_right)
+                # Skip avoidance when face/target navigation is actively steering
+                # (the "obstacle" IS the target — person, flag, etc.)
+                if face_override is not None and _face_approaching:
+                    override, mode = None, ""
+                else:
+                    override, mode = self._compute_avoidance(
+                        min_depth, left_depth, right_depth,
+                        obj_detected, obj_class, obj_center_x, obj_conf,
+                        seg_left_feas=seg_left, seg_right_feas=seg_right)
 
                 # --- 7. RL inference ---
                 obs = {
@@ -1512,9 +2164,10 @@ class RLDeployController:
                 if linear_vel < 0:
                     linear_vel = max(linear_vel, -self.max_speed * 0.3)
 
-                # --- 8. Apply overrides (priority: safety > face search > avoidance > RL) ---
+                # --- 8. Apply overrides (priority: face/target > avoidance > RL) ---
+                # Face override takes HIGHEST priority — it uses direct proportional
+                # control which is more reliable than RL for target following
                 if face_override is not None:
-                    # Face SM is in SEARCH or ARRIVED — it controls the rover
                     linear_vel, angular_vel = face_override
                 elif override is not None and isinstance(override, tuple):
                     linear_vel, angular_vel = override
@@ -1576,6 +2229,45 @@ class RLDeployController:
                         print(f"  [NAV] Off course! Drift: {drift:.0f}, "
                               f"remaining: {remaining:.2f}m")
 
+                # --- 10b. Write frames for web UI (EVERY step for smooth feeds) ---
+                if self.frame_dir:
+                    try:
+                        import cv2
+                        _rgb = self.camera.get_rgb_frame()
+                        if _rgb is not None:
+                            cv2.imwrite(os.path.join(self.frame_dir, 'rgb.jpg'), _rgb,
+                                        [cv2.IMWRITE_JPEG_QUALITY, 40])
+                        # Depth heatmap — always available since we just captured it
+                        _dv = np.clip(depth_frame / 5.0, 0, 1)
+                        _dv = (_dv * 255).astype(np.uint8)
+                        _dc = cv2.applyColorMap(_dv, cv2.COLORMAP_JET)
+                        _dc = cv2.resize(_dc, (640, 480))
+                        cv2.imwrite(os.path.join(self.frame_dir, 'depth.jpg'), _dc,
+                                    [cv2.IMWRITE_JPEG_QUALITY, 40])
+                        # Segmentation overlay — write when available
+                        if (hasattr(self, 'segmenter') and self.segmenter
+                                and hasattr(self.segmenter, '_last_mask')
+                                and self.segmenter._last_mask is not None):
+                            _seg_colors = np.array([
+                                [50, 50, 50], [255, 80, 80],
+                                [0, 200, 0], [0, 0, 255]], dtype=np.uint8)
+                            _mask = self.segmenter._last_mask
+                            _seg = _seg_colors[_mask]
+                            _seg_rgb = _rgb if _rgb is not None else np.zeros(
+                                (_mask.shape[0], _mask.shape[1], 3), dtype=np.uint8)
+                            _seg_rgb_sm = cv2.resize(_seg_rgb,
+                                                     (_mask.shape[1], _mask.shape[0]))
+                            _seg = cv2.addWeighted(_seg_rgb_sm, 0.4, _seg, 0.6, 0)
+                            _seg = cv2.resize(_seg, (640, 480))
+                            cv2.putText(_seg,
+                                        f"Feasibility: L={seg_left:.2f} R={seg_right:.2f}",
+                                        (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                                        (255, 255, 255), 1)
+                            cv2.imwrite(os.path.join(self.frame_dir, 'seg.jpg'), _seg,
+                                        [cv2.IMWRITE_JPEG_QUALITY, 40])
+                    except Exception:
+                        pass
+
                 # --- 11. Log ---
                 step += 1
                 if step % CONTROL_HZ == 0:
@@ -1613,6 +2305,11 @@ class RLDeployController:
                         if self.face_tracker and self.face_tracker.last_face:
                             a, d, _ = self.face_tracker.last_face
                             face_str += f"({math.degrees(a):.0f}°,{d:.1f}m)"
+                        if hasattr(self.face_tracker, '_last_method') and self.face_tracker._last_method:
+                            face_str += f"[{self.face_tracker._last_method}]"
+                        if hasattr(self.face_tracker, '_detect_count') and self.face_tracker._detect_count > 0:
+                            rate = self.face_tracker._found_count / self.face_tracker._detect_count
+                            face_str += f" det={self.face_tracker._found_count}/{self.face_tracker._detect_count}({rate:.0%})"
 
                     # Segmentation info
                     seg_str = ""
@@ -1625,8 +2322,13 @@ class RLDeployController:
                           f" depth={min_depth:.2f}m (L={left_depth:.2f} R={right_depth:.2f})"
                           f"{obj_str}{odom_str}{dest_str}{obs_str}{cc_str}{face_str}{seg_str}")
 
-                # --- 12. Kick off gimbal scan (after depth was captured) ---
-                self.gimbal.update(step, self._avoid_steps_left > 0)
+                # --- 12. Gimbal control ---
+                # If face nav is actively tracking (NAVIGATE/LOST_HOLD), it controls
+                # the gimbal directly — don't let the scanner fight it
+                face_tracking_active = (self.face_nav is not None
+                                        and self.face_nav.state in ('NAVIGATE', 'LOST_HOLD'))
+                if not face_tracking_active:
+                    self.gimbal.update(step, self._avoid_steps_left > 0)
 
                 # --- 13. Maintain control rate ---
                 elapsed_loop = time.time() - loop_start
@@ -1684,8 +2386,8 @@ Examples:
                         help='Disable MobileNet-SSD object detection')
     parser.add_argument('--no-gimbal', action='store_true',
                         help='Disable gimbal pan/tilt scanning')
-    parser.add_argument('--target', choices=['distance', 'face'], default='distance',
-                        help='Navigation mode: distance-based or face-tracking (default: distance)')
+    parser.add_argument('--target', choices=['distance', 'face', 'red'], default='distance',
+                        help='Navigation mode: distance, face-tracking, or red-flag target (default: distance)')
     parser.add_argument('--face-distance', type=float, default=FACE_STOP_DISTANCE,
                         help=f'Stop distance for face target in meters (default: {FACE_STOP_DISTANCE})')
     parser.add_argument('--segmentation', action='store_true',
@@ -1698,6 +2400,8 @@ Examples:
                         help='Log per-step shaped rewards to CSV (no weight updates)')
     parser.add_argument('--reward-log', type=str, default=None,
                         help='Path for reward CSV log (default: rewards_YYYYMMDD_HHMMSS.csv)')
+    parser.add_argument('--frame-dir', type=str, default=None,
+                        help='Write camera frames to this dir for web UI streaming')
 
     args = parser.parse_args()
 
@@ -1734,7 +2438,12 @@ Examples:
         face_stop_distance=args.face_distance,
         log_rewards=args.log_rewards,
         reward_log_path=args.reward_log,
+        frame_dir=args.frame_dir,
     )
+
+    # Create frame dir if specified
+    if args.frame_dir:
+        os.makedirs(args.frame_dir, exist_ok=True)
 
     controller.run(duration=args.duration, target_distance=args.distance)
 

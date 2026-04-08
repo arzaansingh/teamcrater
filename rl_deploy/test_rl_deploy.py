@@ -33,8 +33,10 @@ from rl_deploy import (
     WHEEL_SEPARATION, ENCODER_SCALE,
     DESTINATION_REACHED_TOL, DESTINATION_OFF_COURSE_DEG,
     MODEL_INPUT_SIZE, DEFAULT_STATE, DETECT_OBSTACLE_CLASSES,
-    FACE_HFOV_RAD, FACE_STOP_DISTANCE, FACE_SEARCH_SPEED,
-    FACE_RECHECK_STEPS, FACE_LOST_HOLD_TIME,
+    FACE_HFOV_RAD, FACE_STOP_DISTANCE, FACE_SEARCH_SPIN_SPEED,
+    FACE_SEARCH_SPIN_DURATION, FACE_SEARCH_DRIVE_DURATION,
+    FACE_RECHECK_STEPS, FACE_LOST_HOLD_TIME, FACE_LOST_SPIN_TIME,
+    FACE_MIN_NAVIGATE_STEPS,
     REWARD_FORWARD_PROGRESS, REWARD_WAYPOINT_REACHED,
     PENALTY_BACKUP, PENALTY_EMERGENCY, PENALTY_CLOSE_OBSTACLE,
     PENALTY_SPINNING, PENALTY_IDLE,
@@ -789,37 +791,68 @@ class TestFaceNavigationSM:
         sm = FaceNavigationSM(tracker, odom, stop_distance=stop_distance)
         return sm, tracker
 
-    def test_search_returns_override_when_no_face(self):
-        """In SEARCH with no face, should return rotation override."""
+    def test_search_spin_returns_fast_rotation(self):
+        """In SEARCH_SPIN with no face, should return fast rotation override."""
         sm, tracker = self._make_face_sm()
         depth = np.ones((128, 128), dtype=np.float32) * 3.0
         override, state = sm.update(None, depth)
         assert override is not None
         assert override[0] == 0.0  # no forward motion
-        assert abs(override[1]) == FACE_SEARCH_SPEED
-        assert sm.state == 'SEARCH'
+        assert abs(override[1]) == FACE_SEARCH_SPIN_SPEED
+        assert sm.state == 'SEARCH_SPIN'
 
-    def test_search_to_navigate_on_face_found(self):
-        """Finding a face transitions to NAVIGATE and returns None override."""
+    def test_search_spin_to_drive_after_duration(self):
+        """After spin duration, transitions to SEARCH_DRIVE (RL explores)."""
         sm, tracker = self._make_face_sm()
-        # Mock the tracker to find a face
-        tracker.detect = MagicMock(return_value=(True, 0.1, 3.0))
+        depth = np.ones((128, 128), dtype=np.float32) * 3.0
+        sm._phase_start = time.time() - FACE_SEARCH_SPIN_DURATION - 1
+        override, state = sm.update(None, depth)
+        assert sm.state == 'SEARCH_DRIVE'
+        assert override is None  # RL drives
+
+    def test_search_drive_returns_none_override(self):
+        """During SEARCH_DRIVE, RL drives — override is None."""
+        sm, tracker = self._make_face_sm()
+        sm.state = 'SEARCH_DRIVE'
+        sm._phase_start = time.time()
         depth = np.ones((128, 128), dtype=np.float32) * 3.0
         override, state = sm.update(None, depth)
-        assert override is None  # RL drives
-        assert sm.state == 'NAVIGATE'
-        # State vector should encode the face direction
-        assert abs(state[0] - math.cos(0.1)) < 0.01
-        assert abs(state[1] - math.sin(0.1)) < 0.01
+        assert override is None
+        assert sm.state == 'SEARCH_DRIVE'
+
+    def test_search_drive_to_spin_after_duration(self):
+        """After drive duration, transitions back to SEARCH_SPIN."""
+        sm, tracker = self._make_face_sm()
+        sm.state = 'SEARCH_DRIVE'
+        sm._phase_start = time.time() - FACE_SEARCH_DRIVE_DURATION - 1
+        depth = np.ones((128, 128), dtype=np.float32) * 3.0
+        override, state = sm.update(None, depth)
+        assert sm.state == 'SEARCH_SPIN'
+        assert override is not None
+        assert abs(override[1]) == FACE_SEARCH_SPIN_SPEED
+
+    def test_face_found_during_any_search_goes_navigate(self):
+        """Finding a face in any search state → NAVIGATE."""
+        for start_state in ('SEARCH_SPIN', 'SEARCH_DRIVE'):
+            sm, tracker = self._make_face_sm()
+            sm.state = start_state
+            sm._phase_start = time.time()
+            tracker.detect = MagicMock(return_value=(True, 0.1, 3.0))
+            depth = np.ones((128, 128), dtype=np.float32) * 3.0
+            override, state = sm.update(None, depth)
+            assert override is None  # RL drives
+            assert sm.state == 'NAVIGATE'
+            assert abs(state[0] - math.cos(0.1)) < 0.01
+            assert abs(state[1] - math.sin(0.1)) < 0.01
 
     def test_navigate_returns_none_override(self):
         """During NAVIGATE, override is None — RL model drives."""
         sm, tracker = self._make_face_sm()
         tracker.detect = MagicMock(return_value=(True, 0.2, 5.0))
         depth = np.ones((128, 128), dtype=np.float32) * 3.0
-        # First call: SEARCH → NAVIGATE
-        sm.update(None, depth)
-        # Subsequent calls should return None (RL drives)
+        sm.update(None, depth)  # → NAVIGATE
+        # Make detect return False for non-recheck steps
+        tracker.detect = MagicMock(return_value=(False, 0.0, 0.0))
         override, state = sm.update(None, depth)
         assert override is None
 
@@ -828,9 +861,8 @@ class TestFaceNavigationSM:
         sm, tracker = self._make_face_sm()
         tracker.detect = MagicMock(return_value=(True, 0.1, 5.0))
         depth = np.ones((128, 128), dtype=np.float32) * 3.0
-        sm.update(None, depth)  # SEARCH → NAVIGATE
+        sm.update(None, depth)  # → NAVIGATE
 
-        # Advance past recheck interval
         sm._steps_since_recheck = FACE_RECHECK_STEPS - 1
         tracker.detect = MagicMock(return_value=(True, 0.4, 4.0))
         override, state = sm.update(None, depth)
@@ -838,35 +870,36 @@ class TestFaceNavigationSM:
         assert abs(state[0] - math.cos(0.4)) < 0.01
         assert abs(state[1] - math.sin(0.4)) < 0.01
 
-    def test_arrived_when_close(self):
-        """Face closer than stop_distance → ARRIVED."""
-        sm, tracker = self._make_face_sm(stop_distance=1.5)
-        tracker.detect = MagicMock(return_value=(True, 0.0, 1.0))
-        depth = np.ones((128, 128), dtype=np.float32) * 1.0
-        # SEARCH → should detect close face and arrive
+    def test_arrived_requires_min_navigate_steps(self):
+        """Face close but ARRIVED only after minimum navigation steps."""
+        sm, tracker = self._make_face_sm(stop_distance=2.0)
+        tracker.detect = MagicMock(return_value=(True, 0.0, 1.5))
+        depth = np.ones((128, 128), dtype=np.float32) * 1.5
+        sm.update(None, depth)  # → NAVIGATE
+        assert sm.state == 'NAVIGATE'
+        # At recheck with close face but not enough steps
+        sm._steps_since_recheck = FACE_RECHECK_STEPS - 1
+        sm._navigate_steps = FACE_MIN_NAVIGATE_STEPS - 2
         override, state = sm.update(None, depth)
-        assert sm.reached is True
+        assert sm.state == 'NAVIGATE'  # NOT arrived yet
+        assert sm.reached is False
+
+    def test_arrived_after_min_steps(self):
+        """ARRIVED triggers after enough navigation steps."""
+        sm, tracker = self._make_face_sm(stop_distance=2.0)
+        tracker.detect = MagicMock(return_value=(True, 0.0, 1.5))
+        depth = np.ones((128, 128), dtype=np.float32) * 1.5
+        sm.update(None, depth)  # → NAVIGATE
+        # Enough steps + recheck
+        sm._navigate_steps = FACE_MIN_NAVIGATE_STEPS
+        sm._steps_since_recheck = FACE_RECHECK_STEPS - 1
+        override, state = sm.update(None, depth)
         assert sm.state == 'ARRIVED'
+        assert sm.reached is True
         assert override == (0.0, 0.0)
 
-    def test_navigate_to_lost_when_face_disappears(self):
-        """Face disappears during NAVIGATE → LOST after recheck."""
-        sm, tracker = self._make_face_sm()
-        tracker.detect = MagicMock(return_value=(True, 0.1, 5.0))
-        depth = np.ones((128, 128), dtype=np.float32) * 3.0
-        sm.update(None, depth)  # SEARCH → NAVIGATE
-        assert sm.state == 'NAVIGATE'
-
-        # Face disappears at recheck
-        sm._steps_since_recheck = FACE_RECHECK_STEPS - 1
-        tracker.detect = MagicMock(return_value=(False, 0.0, 0.0))
-        override, state = sm.update(None, depth)
-        assert sm.state == 'LOST'
-        # Should still return None (RL drives with last known state)
-        assert override is None
-
-    def test_lost_to_search_after_timeout(self):
-        """After LOST hold time, transitions back to SEARCH."""
+    def test_navigate_to_lost_hold(self):
+        """Face disappears during NAVIGATE → LOST_HOLD."""
         sm, tracker = self._make_face_sm()
         tracker.detect = MagicMock(return_value=(True, 0.1, 5.0))
         depth = np.ones((128, 128), dtype=np.float32) * 3.0
@@ -874,16 +907,39 @@ class TestFaceNavigationSM:
 
         sm._steps_since_recheck = FACE_RECHECK_STEPS - 1
         tracker.detect = MagicMock(return_value=(False, 0.0, 0.0))
-        sm.update(None, depth)  # → LOST
+        override, state = sm.update(None, depth)
+        assert sm.state == 'LOST_HOLD'
+        assert override is None  # RL drives with last known state
 
-        # Simulate time passing beyond hold time
+    def test_lost_hold_to_lost_spin(self):
+        """After hold time, transitions to LOST_SPIN."""
+        sm, tracker = self._make_face_sm()
+        tracker.detect = MagicMock(return_value=(True, 0.1, 5.0))
+        depth = np.ones((128, 128), dtype=np.float32) * 3.0
+        sm.update(None, depth)  # → NAVIGATE
+
+        sm._steps_since_recheck = FACE_RECHECK_STEPS - 1
+        tracker.detect = MagicMock(return_value=(False, 0.0, 0.0))
+        sm.update(None, depth)  # → LOST_HOLD
+
         sm._lost_time = time.time() - FACE_LOST_HOLD_TIME - 1
         override, state = sm.update(None, depth)
-        assert sm.state == 'SEARCH'
-        assert override is not None  # search rotation
+        assert sm.state == 'LOST_SPIN'
+        assert override is not None
+        assert abs(override[1]) == FACE_SEARCH_SPIN_SPEED
+
+    def test_lost_spin_to_search_after_timeout(self):
+        """After lost spin time, goes back to full SEARCH_SPIN."""
+        sm, tracker = self._make_face_sm()
+        sm.state = 'LOST_SPIN'
+        sm._phase_start = time.time() - FACE_LOST_SPIN_TIME - 1
+        tracker.detect = MagicMock(return_value=(False, 0.0, 0.0))
+        depth = np.ones((128, 128), dtype=np.float32) * 3.0
+        override, state = sm.update(None, depth)
+        assert sm.state == 'SEARCH_SPIN'
 
     def test_lost_reacquire_face(self):
-        """Face re-appears during LOST → back to NAVIGATE."""
+        """Face re-appears during LOST_HOLD → back to NAVIGATE."""
         sm, tracker = self._make_face_sm()
         tracker.detect = MagicMock(return_value=(True, 0.1, 5.0))
         depth = np.ones((128, 128), dtype=np.float32) * 3.0
@@ -891,12 +947,22 @@ class TestFaceNavigationSM:
 
         sm._steps_since_recheck = FACE_RECHECK_STEPS - 1
         tracker.detect = MagicMock(return_value=(False, 0.0, 0.0))
-        sm.update(None, depth)  # → LOST
+        sm.update(None, depth)  # → LOST_HOLD
 
         tracker.detect = MagicMock(return_value=(True, 0.2, 4.0))
         override, state = sm.update(None, depth)
         assert sm.state == 'NAVIGATE'
         assert override is None
+
+    def test_no_search_timeout(self):
+        """Search cycles indefinitely — no timeout."""
+        sm, tracker = self._make_face_sm()
+        # Even after many cycles, should not set reached
+        sm._search_count = 100
+        sm._phase_start = time.time() - FACE_SEARCH_SPIN_DURATION - 1
+        depth = np.ones((128, 128), dtype=np.float32) * 3.0
+        override, state = sm.update(None, depth)
+        assert sm.reached is False
 
 
 # ===================================================================
