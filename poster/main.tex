@@ -1,0 +1,447 @@
+\documentclass[final]{beamer}
+
+\usepackage[orientation=landscape,size=a0,scale=1.14]{beamerposter}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{type1cm}
+\usepackage{microtype}
+
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{tikz}
+\usepackage{qrcode}
+\usepackage{tabularx}
+\usepackage{colortbl}
+\usepackage{array}
+
+\usetikzlibrary{arrows.meta,positioning,shapes.geometric,calc,backgrounds,fit,decorations.markings}
+
+% ===========================
+% Tulane Colors
+% ===========================
+\definecolor{TulaneGreen}{HTML}{006747}
+\definecolor{TulaneBlue}{HTML}{418FDE}
+\definecolor{TulaneKelly}{HTML}{43B02A}
+\definecolor{TulaneDark}{HTML}{003D2B}
+\definecolor{LightGreen}{HTML}{E8F5E9}
+\definecolor{LightBlue}{HTML}{E3F2FD}
+\definecolor{DarkBg}{HTML}{1B2A3A}
+\definecolor{SafetyRed}{HTML}{E53935}
+\definecolor{SafetyOrange}{HTML}{FB8C00}
+\definecolor{SafetyYellow}{HTML}{FDD835}
+\definecolor{SafetyGreen}{HTML}{43A047}
+
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0.08cm}
+\setlength{\columnsep}{1.0cm}
+
+\setbeamerfont{block title}{size=\Large,series=\bfseries}
+\setbeamerfont{block body}{size=\normalsize}
+\setbeamerfont{block title alerted}{size=\Large,series=\bfseries}
+\setbeamerfont{block body alerted}{size=\normalsize}
+
+\setbeamercolor{background canvas}{bg=white}
+\setbeamercolor{normal text}{fg=black,bg=white}
+\setbeamercolor{headline}{fg=white,bg=TulaneGreen}
+\setbeamercolor{footline}{fg=white,bg=TulaneGreen}
+\setbeamercolor{block title}{fg=white,bg=TulaneBlue}
+\setbeamercolor{block body}{fg=black,bg=white}
+\setbeamercolor{block title alerted}{fg=white,bg=TulaneGreen}
+\setbeamercolor{block body alerted}{fg=black,bg=TulaneGreen!10}
+\setbeamercolor{itemize item}{fg=TulaneKelly}
+\setbeamercolor{itemize subitem}{fg=TulaneKelly}
+\setbeamercolor{enumerate item}{fg=TulaneKelly}
+\setbeamertemplate{navigation symbols}{}
+
+% ===========================
+% Safe image inclusion
+% ===========================
+\newcommand{\safeincludegraphics}[2][]{%
+  \IfFileExists{#2}{\includegraphics[#1]{#2}}{%
+    \fbox{\parbox[c][0.10\textheight][c]{0.90\linewidth}{\centering\large Missing: \texttt{#2}}}%
+  }%
+}
+\newcommand{\fitgraphic}[2]{%
+  \safeincludegraphics[width=\linewidth,height=#2,keepaspectratio]{#1}%
+}
+
+\title{Team Crater}
+\author{Mary Ella Scroggie, Arzaan Singh, Mark Zhai}
+\institute{Tulane University}
+
+% ===========================
+% Headline
+% ===========================
+\setbeamertemplate{headline}{%
+  \begin{beamercolorbox}[
+    wd=\paperwidth,
+    ht=4.4cm,
+    dp=0.6cm,
+    leftskip=1.6cm,
+    rightskip=1.6cm,
+    vmode
+  ]{headline}
+    \vspace*{0.25cm}
+    \begin{columns}[t,totalwidth=\paperwidth]
+      \begin{column}{0.84\paperwidth}
+        {\fontsize{52}{58}\selectfont\bfseries
+         Team Crater: Autonomous Lunar Rover Navigation Using RL \& Computer Vision\par}
+        \vspace{0.20cm}
+        {\fontsize{28}{34}\selectfont
+         Mary Ella Scroggie, Arzaan Singh, Mark Zhai
+         \enspace$\cdot$\enspace
+         Faculty Advisors: Dr.\ Zhengming Ding \& Dr.\ Zizhan Zheng
+         \enspace$\cdot$\enspace
+         CMPS 4020 \enspace$\cdot$\enspace SSE\par}
+      \end{column}
+      \begin{column}{0.16\paperwidth}
+        \raggedleft
+        \IfFileExists{tulane_logo.png}{%
+          \includegraphics[height=4.2cm]{tulane_logo.png}%
+        }{}
+      \end{column}
+    \end{columns}
+  \end{beamercolorbox}
+  \vspace{0.08cm}
+}
+
+% ===========================
+% Footline
+% ===========================
+\setbeamertemplate{footline}{%
+  \begin{beamercolorbox}[wd=\paperwidth,ht=1.6cm,dp=0.5cm,leftskip=1.6cm,rightskip=1.6cm]{footline}
+    \large
+    \textbf{GitHub:} \href{https://github.com/arzaansingh/teamcrater}{\texttt{github.com/arzaansingh/teamcrater}}
+    \hfill
+    \textbf{Tulane University} — School of Science \& Engineering — Department of Computer Science
+    \hfill
+    \textbf{Email:} \href{mailto:arzaan@tulane.edu}{\texttt{arzaan@tulane.edu}}
+  \end{beamercolorbox}
+}
+
+\begin{document}
+\begin{frame}[t, fragile]{}
+
+% =========================================================
+% ROW 1 — Main content (~75% of poster height)
+% =========================================================
+\begin{columns}[t,totalwidth=\textwidth]
+
+% ────────────────────────────────────────────────────────
+% COLUMN 1 — Motivation + Architecture + Contributions
+% ────────────────────────────────────────────────────────
+\begin{column}{0.31\textwidth}
+
+\begin{block}{Problem \& Motivation}
+\begin{itemize}
+  \item NASA Artemis program: return humans to Moon by 2026
+  \item Current rovers rely on Earth-based teleoperation
+  \item Communication delay ($\sim$1.3\,s Earth--Moon) limits real-time control
+  \item Need: fully autonomous navigation in unstructured terrain
+  \item Our approach: \textbf{train in simulation, deploy on physical hardware}
+\end{itemize}
+
+\vspace{0.3cm}
+\centering
+\fitgraphic{rover_photo.png}{0.18\textheight}
+\end{block}
+
+\begin{block}{System Architecture}
+\centering
+\vspace{0.2cm}
+% ── TikZ: System Architecture Flowchart ──
+\begin{tikzpicture}[
+    node distance=1.1cm,
+    box/.style={
+      draw=TulaneBlue, line width=1.5pt,
+      fill=TulaneBlue!8, rounded corners=6pt,
+      minimum width=12cm, minimum height=1.7cm,
+      font=\large\bfseries, text=TulaneDark,
+      align=center
+    },
+    arrow/.style={
+      -{Stealth[length=5mm,width=3mm]},
+      line width=1.5pt, TulaneGreen
+    },
+    label/.style={
+      font=\small\itshape, TulaneGreen!80!black,
+      fill=white, inner sep=2pt
+    }
+  ]
+  \node[box] (sim)   {Simulation Environment\\[-2pt]{\normalsize\normalfont SRB (Isaac Sim) + Unity}};
+  \node[box, below=of sim] (rl)    {RL Training\\[-2pt]{\normalsize\normalfont PPO via RL-Games, 120M steps}};
+  \node[box, below=of rl]  (rover) {Physical Rover\\[-2pt]{\normalsize\normalfont Jetson Orin Nano + ESP32}};
+  \node[box, below=of rover](nav)  {Autonomous Navigation\\[-2pt]{\normalsize\normalfont 5\,Hz control loop + safety system}};
+  \node[box, below=of nav] (cv)    {Computer Vision\\[-2pt]{\normalsize\normalfont MobileNet-V2 UNet segmentation}};
+
+  \draw[arrow] (sim) -- node[label,right,xshift=3pt] {depth maps} (rl);
+  \draw[arrow] (rl)  -- node[label,right,xshift=3pt] {ONNX policy} (rover);
+  \draw[arrow] (rover)-- node[label,right,xshift=3pt] {motor cmds} (nav);
+  \draw[arrow] (cv)  -- node[label,right,xshift=3pt] {terrain masks} (nav);
+\end{tikzpicture}
+\vspace{0.2cm}
+\end{block}
+
+\begin{alertblock}{Key Contributions}
+\begin{itemize}
+  \item \textbf{Sim-to-real transfer} of RL navigation onto small-scale rover
+  \item \textbf{Real-time terrain segmentation} on Jetson edge hardware
+  \item \textbf{Three-tier safety system} with obstacle memory
+  \item \textbf{Web-based mission control} for remote monitoring
+  \item \textbf{3D coordinate tracking} with active gimbal compensation
+\end{itemize}
+\end{alertblock}
+
+\end{column}
+
+% ────────────────────────────────────────────────────────
+% COLUMN 2 — Three System Components
+% ────────────────────────────────────────────────────────
+\begin{column}{0.36\textwidth}
+
+\begin{block}{Simulation Environment \normalfont\textit{— Mary Ella Scroggie}}
+\begin{itemize}
+  \item NVIDIA Space Robotics Bench (Isaac Sim) for RL training
+  \item Custom Unity environment with procedural lunar terrain
+  \item Craters, varying elevations, realistic lighting conditions
+  \item 6-wheel differential steering matching physical rover
+\end{itemize}
+
+\vspace{0.2cm}
+\centering
+\fitgraphic{sim_screenshot.png}{0.14\textheight}
+\end{block}
+
+\begin{block}{Reinforcement Learning \normalfont\textit{— Arzaan Singh}}
+\begin{itemize}
+  \item PPO algorithm via RL-Games library
+  \item 128$\times$128 depth camera observations (no privileged telemetry)
+  \item Trained 120M timesteps in SRB; ONNX export for Jetson at 5\,Hz
+  \item Sim-to-real: depth-only input bridges simulation--hardware gap
+\end{itemize}
+
+\vspace{0.3cm}
+\centering
+% ── TikZ: Three-Tier Safety System ──
+\begin{tikzpicture}[
+    tier/.style={
+      minimum height=1.1cm,
+      rounded corners=4pt,
+      font=\normalsize\bfseries,
+      text=white,
+      anchor=west,
+      inner xsep=8pt
+    }
+  ]
+  % Distance scale
+  \node[font=\small\bfseries, TulaneDark] at (0,5.0) {Three-Tier Safety System};
+
+  % Bars (wider = farther range = less urgent)
+  \node[tier, fill=SafetyRed,    minimum width=3.5cm]  at (0,4.0) {Emergency};
+  \node[tier, fill=SafetyOrange, minimum width=6.5cm]  at (0,2.8) {Backup};
+  \node[tier, fill=SafetyYellow, minimum width=9.5cm, text=black]  at (0,1.6) {Avoid};
+  \node[tier, fill=SafetyGreen,  minimum width=12.5cm] at (0,0.4) {Slow};
+
+  % Distance labels
+  \node[font=\small, anchor=west, TulaneDark] at (3.7,4.0) {$\le$5\,cm — Stop + backup + turn};
+  \node[font=\small, anchor=west, TulaneDark] at (6.7,2.8) {$\le$15\,cm — Active reverse};
+  \node[font=\small, anchor=west, TulaneDark] at (9.7,1.6) {$\le$25\,cm — Committed turn};
+  \node[font=\small, anchor=west, TulaneDark] at (12.7,0.4) {$\le$45\,cm — Reduce speed};
+\end{tikzpicture}
+\vspace{0.2cm}
+\end{block}
+
+\begin{block}{Computer Vision \normalfont\textit{— Mark Zhai}}
+\begin{itemize}
+  \item MobileNet-V2 UNet trained on 9,766 lunar renders
+  \item Semantic segmentation: obstacles vs.\ traversable terrain
+  \item Directional search: frame divided into 5~sectors, each scored
+  \item Path feasibility ratio fed to RL as additional observation
+\end{itemize}
+
+\vspace{0.2cm}
+\centering
+\fitgraphic{seg_example.png}{0.14\textheight}
+\end{block}
+
+\end{column}
+
+% ────────────────────────────────────────────────────────
+% COLUMN 3 — Integration + Evaluation
+% ────────────────────────────────────────────────────────
+\begin{column}{0.31\textwidth}
+
+\begin{block}{Integration \& Deployment}
+\centering
+\vspace{0.2cm}
+% ── TikZ: Hardware Stack Diagram ──
+\begin{tikzpicture}[
+    comp/.style={
+      draw=TulaneBlue, line width=1pt,
+      fill=TulaneBlue!6, rounded corners=4pt,
+      minimum width=11cm, minimum height=1.2cm,
+      font=\normalsize, align=center
+    },
+    lbl/.style={
+      font=\small\bfseries, TulaneGreen, anchor=east
+    }
+  ]
+  \node[comp] (platform) at (0,0)   {\textbf{Waveshare UGV Rover PT} — 6-wheel differential drive};
+  \node[comp] (compute)  at (0,1.6) {\textbf{Jetson Orin Nano} — Ubuntu 22.04, ONNX Runtime};
+  \node[comp] (camera)   at (0,3.2) {\textbf{OAK-D Lite} — Stereo RGB + Depth (128$\times$128)};
+  \node[comp] (ctrl)     at (0,4.8) {\textbf{ESP32} — UART 115200 baud, 5\,Hz motor commands};
+  \node[comp] (web)      at (0,6.4) {\textbf{Mission Control} — Flask + SocketIO, MJPEG streams};
+
+  \foreach \a/\b in {web/ctrl, ctrl/camera, camera/compute, compute/platform} {
+    \draw[-{Stealth[length=3mm]}, TulaneKelly, line width=1pt] (\a) -- (\b);
+  }
+\end{tikzpicture}
+\vspace{0.3cm}
+
+\begin{itemize}
+  \item One-command deployment via \texttt{start.sh}
+  \item Remote access over Tailscale VPN
+  \item Heartbeat auto-stop: no command for 3\,s $\to$ motors halt
+\end{itemize}
+\end{block}
+
+\begin{alertblock}{Evaluation}
+\centering
+\vspace{0.2cm}
+% ── TikZ: Key Metrics Dashboard ──
+\begin{tikzpicture}[
+    metric/.style={
+      draw=TulaneGreen!50, line width=1pt,
+      fill=TulaneGreen!5, rounded corners=6pt,
+      minimum width=4.8cm, minimum height=2.4cm,
+      font=\normalsize, align=center
+    }
+  ]
+  \node[metric] (tests) at (0,0)     {{\fontsize{36}{40}\selectfont\bfseries\color{TulaneGreen} 117+}\\[2pt]Unit Tests\\{\small 19 test classes}};
+  \node[metric] (hz)    at (5.4,0)   {{\fontsize{36}{40}\selectfont\bfseries\color{TulaneGreen} 5\,Hz}\\[2pt]Control Rate\\{\small Real-time}};
+  \node[metric] (iter)  at (0,-3.2)  {{\fontsize{36}{40}\selectfont\bfseries\color{TulaneGreen} 120M}\\[2pt]Training Steps\\{\small PPO in SRB}};
+  \node[metric] (round) at (5.4,-3.2){{\fontsize{36}{40}\selectfont\bfseries\color{TulaneGreen} 4+}\\[2pt]Testing Rounds\\{\small Real-world}};
+\end{tikzpicture}
+\vspace{0.2cm}
+
+\begin{itemize}
+  \item Zero collisions with three-tier safety active
+  \item Background segmentation: 31\,FPS capture, 0.6\,FPS inference
+  \item Dry-run and demo modes for safe testing
+\end{itemize}
+\end{alertblock}
+
+\begin{block}{Challenges \& Lessons}
+\begin{itemize}
+  \item \textbf{Stereo dead zone:} OAK-D Lite returns 0 depth $<$20\,cm\\
+        \textit{Solved:} 85\% zero-pixel threshold triggers emergency protocol
+  \item \textbf{Sim-to-real gap:} Simulation sensors $\ne$ physical camera\\
+        \textit{Solved:} Depth-only observations, visual task variant
+  \item \textbf{Safety vs.\ autonomy:} Aggressive thresholds $\to$ excessive caution\\
+        \textit{Solved:} Iterative real-world tuning across 4+ rounds
+  \item \textbf{API breaks:} DepthAI v2$\to$v3 broke camera initialization\\
+        \textit{Solved:} Complete pipeline rewrite for v3 API
+\end{itemize}
+\end{block}
+
+\end{column}
+\end{columns}
+
+\vfill
+
+% =========================================================
+% ROW 2 — Supporting content (~25% of poster height)
+% =========================================================
+\begin{columns}[t,totalwidth=\textwidth]
+
+% ────────────────────────────────────────────────────────
+% ROW 2 COL 1 — Mission Control
+% ────────────────────────────────────────────────────────
+\begin{column}{0.325\textwidth}
+
+\begin{block}{Mission Control Center}
+\begin{itemize}
+  \item Flask + SocketIO web interface for remote operation
+  \item Live MJPEG camera feeds: RGB, depth, segmentation
+  \item WASD manual control + gimbal pan/tilt sliders
+  \item One-click autonomous mission launch and E-STOP
+  \item Real-time log streaming and telemetry dashboard
+\end{itemize}
+
+\vspace{0.2cm}
+\centering
+\fitgraphic{mission_control.png}{0.10\textheight}
+\end{block}
+
+\end{column}
+
+% ────────────────────────────────────────────────────────
+% ROW 2 COL 2 — Related Work + Future
+% ────────────────────────────────────────────────────────
+\begin{column}{0.325\textwidth}
+
+\begin{block}{Related Work}
+\begin{itemize}
+  \item \textbf{NASA VIPER:} Teleoperated, no onboard autonomy
+  \item \textbf{Perseverance AutoNav:} Classical path planning, no RL
+  \item \textbf{Stanford/CMU sim-to-real:} Large platforms, server-grade compute
+  \item \textbf{Our novelty:} Full RL+CV pipeline on \textit{small-scale edge hardware}
+\end{itemize}
+\end{block}
+
+\begin{block}{Future Work}
+\begin{itemize}
+  \item Multi-waypoint autonomous navigation sequences
+  \item Unity simulation with ML object detection as RL input
+  \item Extended outdoor testing on varied terrain and lighting
+  \item Improved depth estimation for close-range objects ($<$20\,cm)
+\end{itemize}
+\end{block}
+
+\end{column}
+
+% ────────────────────────────────────────────────────────
+% ROW 2 COL 3 — QR Codes + References
+% ────────────────────────────────────────────────────────
+\begin{column}{0.325\textwidth}
+
+\begin{block}{Demo \& Code}
+\centering
+\vspace{0.1cm}
+\begin{columns}[c]
+  \begin{column}{0.45\linewidth}
+    \centering
+    \qrcode[height=4.5cm]{https://github.com/arzaansingh/teamcrater}\\[0.3cm]
+    {\normalsize\bfseries GitHub Repository}
+  \end{column}
+  \begin{column}{0.45\linewidth}
+    \centering
+    \qrcode[height=4.5cm]{https://github.com/arzaansingh/teamcrater}\\[0.3cm]
+    {\normalsize\bfseries YouTube Demo}
+  \end{column}
+\end{columns}
+\vspace{0.1cm}
+\end{block}
+
+\begin{block}{References}
+\small
+\begin{thebibliography}{9}\setlength{\itemsep}{0.04cm}
+\bibitem{PPO} J.\,Schulman et al. ``Proximal Policy Optimization,'' \emph{arXiv}, 2017.
+\bibitem{SRB} S.\,Mittal et al. ``Space Robotics Bench,'' 2023.
+\bibitem{UNet} O.\,Ronneberger et al. ``U-Net,'' \emph{MICCAI}, 2015.
+\bibitem{MNv2} M.\,Sandler et al. ``MobileNetV2,'' \emph{CVPR}, 2018.
+\bibitem{Isaac} NVIDIA. ``Isaac Sim Documentation,'' 2024.
+\bibitem{RLG} D.\,Makoviichuk. ``rl\_games: High-performance RL library,'' 2021.
+\end{thebibliography}
+\normalsize
+\end{block}
+
+\end{column}
+\end{columns}
+
+\end{frame}
+\end{document}
